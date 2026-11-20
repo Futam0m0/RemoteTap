@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Python (backend)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+ENV/
+
+# Test / type-check / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit*.xml
+
+# ---------------------------------------------------------------------------
+# Node / Expo (mobile app)
+# ---------------------------------------------------------------------------
+node_modules/
+.expo/
+.expo-shared/
+dist/
+web-build/
+*.tsbuildinfo
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# Expo / EAS build credentials and keystores — never commit these
+*.jks
+*.keystore
+*.p8
+*.p12
+*.key
+*.mobileprovision
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Secrets and local configuration
+# ---------------------------------------------------------------------------
+# The device auth token and any local overrides must stay out of git.
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+*.token
+config.local.json
+
+# ---------------------------------------------------------------------------
+# Logs and runtime artefacts
+# ---------------------------------------------------------------------------
+*.log
+logs/
+*.pid
+*.sqlite3
+
+# ---------------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini

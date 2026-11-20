@@ -1,0 +1,17 @@
+# RemoteTap — Python dependencies
+#
+# RUNTIME
+#   The backend intentionally has no third-party runtime dependencies.
+#   It is built on the Python 3 standard library only:
+#     asyncio, socket, json, dataclasses, enum, logging, secrets, argparse
+#   Deliberate choices for the prototype:
+#     - No web framework: the transport is raw TCP/UDP, not HTTP.
+#     - No cloud SDK: RemoteTap talks to the device over Tailscale directly.
+#     - No GPIO library yet: the actuator is simulated at this stage.
+#
+#   Tailscale itself is a system-level client, not a Python package, so it is
+#   not listed here.
+#
+# DEVELOPMENT / TESTING
+pytest>=8.0
+pytest-asyncio>=0.24
