@@ -4,10 +4,21 @@ Usage::
 
     python -m remote_tap.client --host 127.0.0.1 --port 8765
 
-Then type ``press``, ``stop``, ``status``, ``help`` or ``quit``.
+Then type ``press``, ``renew``, ``stop``, ``status``, ``help`` or ``quit``.
 
 The client keeps one TCP connection open and sends exactly one command per
 input, printing both the JSON it sends and the JSON it receives.
+
+A press is a lease: the device releases it if it is not renewed. After a
+successful ``press`` this client prints the renewal interval the device asks
+for, and ``renew`` sends one ``PRESS_RENEW`` for the current session.
+
+Every command carries a fresh ``command_id``, so each ``renew`` is a new
+command and extends the lease exactly once. Re-sending an identical renewal is
+treated as a retry and does **not** extend the lease again. If a renewal is
+answered with ``LEASE_EXPIRED`` or ``INVALID_SESSION`` the press is over and the
+client should stop renewing; a cached reply never claims an expired press is
+still active.
 """
 
 from __future__ import annotations
@@ -27,10 +38,21 @@ logger = logging.getLogger("remote_tap.client")
 PROMPT = "remotetap> "
 HELP_TEXT = """commands:
   press   send PRESS_START with a new session id
+  renew   send PRESS_RENEW for the current session id (keeps the press alive)
   stop    send PRESS_STOP for the current session id
   status  show the last state reported by the server (local, no request sent)
   help    show this help
   quit    close the connection and exit
+
+lease notes:
+  Every command gets a fresh command_id, and every periodic 'renew' must be a
+  NEW command: re-sending the exact same renewal is treated as a retry, is
+  answered from the device's cache, and does NOT extend the lease a second time.
+  A lost renewal reply does not necessarily mean the renewal failed - the
+  'renew' here retries the outcome for you. If a renewal is answered with
+  LEASE_EXPIRED or INVALID_SESSION the press is over: stop renewing and treat
+  the hold as ended. A cached reply never claims an expired press is still
+  active.
 """
 
 
@@ -45,6 +67,8 @@ class RemoteTapClient:
         self._writer: asyncio.StreamWriter | None = None
         self._session_id: str | None = None
         self._last_state: str | None = None
+        self._renew_interval_ms: int | None = None
+        self._max_press_ms: int | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -55,6 +79,11 @@ class RemoteTapClient:
     def last_state(self) -> str | None:
         """State most recently reported by the server."""
         return self._last_state
+
+    @property
+    def lease_policy(self) -> tuple[int | None, int | None]:
+        """The ``(renew_interval_ms, max_press_ms)`` the device last advertised."""
+        return self._renew_interval_ms, self._max_press_ms
 
     def start_new_session(self) -> str:
         """Begin a new session and return its id."""
@@ -103,6 +132,14 @@ class RemoteTapClient:
         state = response.get("state")
         if isinstance(state, str):
             self._last_state = state
+        # The device advertises its lease policy on a press or a renewal, so the
+        # client never has to guess the timings it is being measured against.
+        interval = response.get("renew_interval_ms")
+        if isinstance(interval, int):
+            self._renew_interval_ms = interval
+        max_press = response.get("max_press_ms")
+        if isinstance(max_press, int):
+            self._max_press_ms = max_press
         return response
 
 
@@ -140,6 +177,14 @@ async def run_interactive(client: RemoteTapClient) -> None:
             client.start_new_session()
             if not await _send_or_report(client, CommandType.PRESS_START):
                 return
+            _report_lease_policy(client)
+            continue
+        if command == "renew":
+            if client.session_id is None:
+                print("[client] no session yet: send 'press' first")
+                continue
+            if not await _send_or_report(client, CommandType.PRESS_RENEW):
+                return
             continue
         if command == "stop":
             if client.session_id is None:
@@ -172,11 +217,26 @@ async def _send_or_report(client: RemoteTapClient, command_type: CommandType) ->
     return True
 
 
+def _report_lease_policy(client: RemoteTapClient) -> None:
+    """Print how often the device wants a press to be renewed.
+
+    The numbers come from the device's own acknowledgement, so they stay right
+    when the service is started with different ``--*-ms`` limits.
+    """
+    interval, max_press = client.lease_policy
+    if interval is None:
+        return
+    print(
+        f"[client] the device releases this press unless 'renew' is sent every "
+        f"{interval} ms, and at {max_press} ms at the latest"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser for the client."""
     parser = argparse.ArgumentParser(
         prog="remote_tap.client",
-        description="Interactive RemoteTap client (Phase 1: TCP only).",
+        description="Interactive RemoteTap client (Phase 2: TCP + press lease).",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="server address (default: %(default)s)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="server port (default: %(default)s)")

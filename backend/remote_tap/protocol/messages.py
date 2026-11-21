@@ -1,9 +1,12 @@
-"""Message definitions for the RemoteTap TCP command protocol (Phase 1).
+"""Message definitions for the RemoteTap TCP command protocol.
 
-Phase 1 supports two commands and two responses:
+The client sends three commands and the device answers with two responses:
 
-* ``PRESS_START`` / ``PRESS_STOP`` sent by the client
+* ``PRESS_START`` / ``PRESS_RENEW`` / ``PRESS_STOP`` sent by the client
 * ``ACK`` / ``ERROR`` sent by the device
+
+``PRESS_RENEW`` is the Phase 2 addition: a press is a *lease*, and the owning
+connection keeps it alive by renewing it before the lease times out.
 
 Each message is a single JSON object serialised on one line and terminated by a
 newline character. The newline is the only framing the protocol has, which is
@@ -25,6 +28,7 @@ class CommandType(str, Enum):
     """Commands a client may send."""
 
     PRESS_START = "PRESS_START"
+    PRESS_RENEW = "PRESS_RENEW"
     PRESS_STOP = "PRESS_STOP"
 
 
@@ -41,6 +45,9 @@ class ErrorCode(str, Enum):
 
     # State-level problems (detected by the session layer).
     INVALID_SESSION = "INVALID_SESSION"
+    #: A renewal or stop arrived for a press the device already ended because a
+    #: safety limit was reached.
+    LEASE_EXPIRED = "LEASE_EXPIRED"
 
     # Anything unexpected on our side.
     INTERNAL = "INTERNAL"
@@ -61,13 +68,29 @@ class Ack:
 
     ``state`` is the actuator state *after* the command was applied, so the
     client can always tell what the device believes is true.
+
+    ``renew_interval_ms`` and ``max_press_ms`` carry the device's lease policy
+    on a successful press start or renewal, so the client knows how often to
+    renew and how long a press can possibly last. They are omitted from replies
+    that end a press, where no lease is running any more.
     """
 
     command_id: str
     state: str
+    renew_interval_ms: int | None = None
+    max_press_ms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": "ACK", "command_id": self.command_id, "state": self.state}
+        payload: dict[str, Any] = {
+            "type": "ACK",
+            "command_id": self.command_id,
+            "state": self.state,
+        }
+        if self.renew_interval_ms is not None:
+            payload["renew_interval_ms"] = self.renew_interval_ms
+        if self.max_press_ms is not None:
+            payload["max_press_ms"] = self.max_press_ms
+        return payload
 
 
 @dataclass(frozen=True)

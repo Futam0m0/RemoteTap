@@ -33,6 +33,16 @@ def test_parses_a_valid_press_stop() -> None:
     assert parse_command(line).type is CommandType.PRESS_STOP
 
 
+def test_parses_a_valid_press_renew() -> None:
+    line = b'{"type":"PRESS_RENEW","command_id":"c3","session_id":"s1"}'
+
+    command = parse_command(line)
+
+    assert command.type is CommandType.PRESS_RENEW
+    assert command.command_id == "c3"
+    assert command.session_id == "s1"
+
+
 def test_tolerates_crlf_line_endings() -> None:
     line = b'{"type":"PRESS_START","command_id":"c1","session_id":"s1"}\r'
 
@@ -89,6 +99,29 @@ def test_ack_serialises_to_a_single_newline_terminated_line() -> None:
         "type": "ACK",
         "command_id": "c1",
         "state": "PRESSING",
+    }
+
+
+def test_ack_without_a_lease_policy_omits_the_lease_fields() -> None:
+    payload = Ack(command_id="c1", state="IDLE").to_dict()
+
+    assert payload == {"type": "ACK", "command_id": "c1", "state": "IDLE"}
+
+
+def test_ack_advertises_the_lease_policy_when_it_has_one() -> None:
+    payload = Ack(
+        command_id="c1",
+        state="PRESSING",
+        renew_interval_ms=250,
+        max_press_ms=3000,
+    ).to_dict()
+
+    assert payload == {
+        "type": "ACK",
+        "command_id": "c1",
+        "state": "PRESSING",
+        "renew_interval_ms": 250,
+        "max_press_ms": 3000,
     }
 
 

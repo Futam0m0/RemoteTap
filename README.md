@@ -12,22 +12,62 @@ motherboard's power header) directly.
 
 ## Current status
 
-**Prototype phase — software only.**
+**Phase 3 — software only, simulated actuator.**
 
 The hardware layer is deliberately not implemented yet. During this phase we
-build and test the complete networking, session and safety logic against a
+build and test the networking, session, ownership and safety logic against a
 **simulated actuator** that logs what a real actuator would do.
 
-Not implemented yet (by design):
+Two transports are used, with different responsibilities: **TCP carries
+commands** (the only way to change the actuator, and the only input to the
+lease), and **UDP carries status** (a read-only heartbeat the device emits so a
+monitoring client can watch it).
 
-- Raspberry Pi GPIO / servo / mechanical parts
-- The mobile application
-- UDP heartbeat, the safety lease and the watchdog (Phase 2)
-- Authentication ([TBD] in docs/architecture.md)
+Implemented today:
 
-What exists today: **Phase 1** — an asyncio TCP command server, a simulated
-actuator, an interactive command-line client and the pytest suite. The design
-documents live in [`docs/`](docs/).
+- **TCP command server** (asyncio) speaking newline-delimited JSON (JSON Lines).
+- **Protocol**: `PRESS_START`, `PRESS_RENEW`, `PRESS_STOP` commands and `ACK`,
+  `ERROR` responses, with `command_id`, `session_id` and a `state` field.
+- **Exclusive session ownership**: the connection that starts a press is the only
+  connection that may renew or stop it. Another connection cannot control the
+  session even if it knows the session id. Disconnecting the owner releases the
+  actuator, so reconnecting starts a new session.
+- **Press lease (Phase 2 safety)**: a press is a lease the owning connection must
+  renew with `PRESS_RENEW` every 250 ms. If no renewal arrives within the
+  1000 ms lease timeout, the device releases the button itself. A press is also
+  released at 3000 ms regardless of renewals — the maximum duration can never be
+  extended by a client. All three values live in [`backend/remote_tap/config.py`](backend/remote_tap/config.py)
+  and can be overridden with command-line flags.
+- **Idempotent commands**: a retried `(session_id, command_id)` returns its
+  cached response without re-running the action; if that cached response is no
+  longer true (the press has since ended) the retry gets the current state
+  instead, and is never executed again.
+- **Error handling** for malformed JSON, unknown commands, missing/invalid
+  fields, wrong sessions, expired leases and oversized lines.
+- **UDP heartbeat / status channel (Phase 3)**: the device emits a small JSON
+  datagram (heartbeat or status) every 1000 ms describing whether it is alive and
+  what the actuator is doing. Datagrams carry a version, a device id, an
+  incrementing sequence number and a timestamp, so a receiver can detect lost,
+  duplicate and out-of-order packets and decide when the device has gone stale.
+  The channel is **outbound-only and read-only**: the device never accepts a UDP
+  command, and nothing in a datagram can press, renew, stop or otherwise
+  influence the actuator or the lease.
+- **UDP monitoring client** (`python -m remote_tap.monitor`): a console tool that
+  receives heartbeats and prints the device's status, sequence number, missing
+  heartbeats, duplicates, out-of-order datagrams and an "offline" notice when
+  beats stop. It is a **development and protocol demonstration tool**, not part
+  of the mobile product, and there is no graphical dashboard.
+- **Simulated actuator**, an **interactive command-line client** and the
+  **pytest suite** (176 tests).
+
+Planned, **not implemented** yet (by design):
+
+- **Authentication** ([TBD] in docs/architecture.md). Neither channel is
+  authenticated today, and UDP datagrams are not authenticated or secure.
+- **Raspberry Pi hardware**: GPIO / servo / mechanical parts.
+- **The mobile application.**
+
+The design documents live in [`docs/`](docs/).
 
 ## Target hardware (future)
 
@@ -52,18 +92,20 @@ RemoteTap/
 ├── backend/               # Python 3 asyncio device service
 │   ├── pytest.ini         # pytest configuration
 │   ├── remote_tap/
-│   │   ├── app.py         # server entry point
-│   │   ├── client.py      # interactive command-line client
-│   │   ├── config.py      # host, port, size limits
-│   │   ├── session.py     # device state and command handling
-│   │   ├── net/           # tcp_server.py
-│   │   ├── protocol/      # messages.py, validate.py
+│   │   ├── app.py         # server entry point (TCP + UDP)
+│   │   ├── client.py      # interactive command-line client (TCP)
+│   │   ├── monitor.py     # UDP heartbeat monitor (development tool)
+│   │   ├── config.py      # host, port, size limits, press-safety limits, UDP settings
+│   │   ├── session.py     # actuator state, session ownership, idempotency, lease wiring
+│   │   ├── net/           # tcp_server.py, udp_heartbeat.py
+│   │   ├── protocol/      # messages.py, validate.py, udp_messages.py
+│   │   ├── safety/        # watchdog.py (lease timer, maximum-duration timer)
 │   │   └── actuator/      # base.py (interface), simulator.py
-│   └── tests/             # pytest suite (protocol, actuator, session, TCP)
+│   └── tests/             # pytest suite (protocol, actuator, session, safety, TCP, UDP)
 └── mobile/                # Expo + React Native + TypeScript app (later phase)
 ```
 
-Phase 1 creates the backend only. `mobile/` arrives in a later phase, so no
+Phases 1–3 create the backend only. `mobile/` arrives in a later phase, so no
 empty placeholder folder is committed.
 
 ## Prerequisites
@@ -82,10 +124,24 @@ For later phases:
 
 ## How to run the project
 
-Phase 1 needs two terminals: one for the device service, one for the client.
-Both commands are run from `backend/`.
+The prototype needs up to three terminals: the device service (TCP commands +
+UDP heartbeats), the command client, and — optionally — the UDP status monitor.
 
-**Setup (once):**
+> **Run every command from `backend/`, with the virtual environment active.**
+> `remote_tap` is a package inside `backend/`, so `python -m remote_tap...` only
+> resolves from there. From the repository root — or with the system Python
+> instead of the venv — it fails with
+> `No module named 'remote_tap'`. In each new terminal:
+>
+> ```powershell
+> cd "path\to\RemoteTap\backend"
+> .\.venv\Scripts\activate          # then use `python -m remote_tap...`
+> ```
+>
+> Without activating, call the interpreter directly:
+> `.\.venv\Scripts\python.exe -m remote_tap.app ...`.
+
+**Setup (once, from `backend/`):**
 
 ```bash
 python -m venv .venv
@@ -94,18 +150,25 @@ source .venv/bin/activate       # Linux / macOS
 pip install -r ..\requirements.txt
 ```
 
-**1. Terminal A - the device service:**
+**1. Terminal A - the device service** (cwd `backend/`, venv active):
 
 ```bash
 python -m remote_tap.app --host 127.0.0.1 --port 8765
 ```
 
-It prints the actuator transitions, so every press and release is visible:
+It prints the actuator transitions, the press-safety policy it enforces and the
+UDP heartbeat settings:
 
 ```
 RemoteTap device service
   listening : 127.0.0.1:8765 (TCP)
   actuator  : simulated - no hardware is driven
+  lease     : renew every 250 ms, release after 1000 ms without one
+  max press : 3000 ms, renewals cannot extend it
+  heartbeat : 1000 ms to 127.0.0.1:8766 (UDP, read-only status)
+  monitor   : python -m remote_tap.monitor --host 127.0.0.1 --port 8766
+  client    : python -m remote_tap.client --host 127.0.0.1 --port 8765
+  stop      : Ctrl+C
 [actuator:sim] IDLE -> PRESSING
 [actuator:sim] PRESSING -> IDLE
 ```
@@ -114,22 +177,79 @@ RemoteTap device service
 pass the address that machine can see (for example the Tailscale address), never
 a public interface unless you know the network is private.
 
-**2. Terminal B - the client:**
+The three press timings can be overridden for experimentation, for example:
+
+```bash
+python -m remote_tap.app --renew-interval-ms 250 --lease-timeout-ms 1000 --max-press-ms 3000
+```
+
+`--lease-timeout-ms` must be greater than `--renew-interval-ms`, and
+`--max-press-ms` must be at least `--lease-timeout-ms`; other combinations are
+rejected at startup.
+
+The UDP settings are configured **separately** from the TCP port:
+
+```bash
+python -m remote_tap.app --udp-dest-host 127.0.0.1 --udp-dest-port 8766 \
+                         --heartbeat-interval-ms 1000 --stale-ms 3000 \
+                         --device-id remotetap-01
+```
+
+`--heartbeat-interval-ms` must be between 1 and 60000 ms, and `--stale-ms` must
+be at least twice the heartbeat interval (so one lost heartbeat does not make a
+healthy device look offline); invalid combinations are rejected at startup.
+Pass `--no-udp` to run TCP only — command handling is unaffected. Nothing here
+hardcodes a development machine's address: every address is a flag, and the
+device's UDP socket binds an ephemeral source port (`--udp-bind-port 0`, the
+default) because it never receives.
+
+**2. Terminal B - the command client** (cwd `backend/`, venv active):
 
 ```bash
 python -m remote_tap.client --host 127.0.0.1 --port 8765
 ```
 
-Then type `press`, `stop`, `status`, `help` or `quit`. Presses are held until you
-send `stop` or close the client; closing the client releases the actuator.
+Then type `press`, `renew`, `stop`, `status`, `help` or `quit`. `press` starts a
+hold and reports the lease policy the device advertised; the press is then
+released by the device unless you keep sending `renew` before the lease timeout,
+and it always ends at the maximum duration. `stop` or closing the client releases
+the actuator immediately.
 
-**3. Tests, from `backend/`:**
+**3. Terminal C (optional) - the UDP status monitor** (cwd `backend/`, venv active):
+
+```bash
+python -m remote_tap.monitor --host 127.0.0.1 --port 8766
+```
+
+It listens for the device's heartbeats and prints each one it accepts, for
+example:
+
+```
+[monitor] listening on 127.0.0.1:8766 (UDP), stale after 3000 ms
+[monitor] seq=1 type=status state=IDLE session_active=no device=remotetap-01 from ('127.0.0.1', 54321)
+[monitor] seq=2 type=heartbeat state=IDLE session_active=no device=remotetap-01 from ('127.0.0.1', 54321)
+[monitor] seq=3 type=status state=PRESSING session_active=yes device=remotetap-01 from ('127.0.0.1', 54321)
+```
+
+Press the button in Terminal B while watching Terminal C to see `state` move to
+`PRESSING` and back. If you stop the device service, the monitor reports the
+outage once:
+
+```
+[monitor] device OFFLINE (no status for 3000 ms; last seq=7)
+```
+
+Useful flags: `--stale-ms` (offline threshold), `--device-id` (ignore datagrams
+from any other device) and `--verbose`. The monitor cannot command the device:
+it only reads datagrams.
+
+**4. Tests, from `backend/`:**
 
 ```bash
 pytest -q
 ```
 
-**4. Mobile app (later phase), from `mobile/`:**
+**5. Mobile app (later phase), from `mobile/`:**
 
 ```bash
 npm install
@@ -143,25 +263,37 @@ backend can run on the same machine using the loopback address.
 ## Safety in one paragraph
 
 The device — not the app — is the authority on how long the button may be held.
-A press starts a bounded "hold lease"; the app must keep renewing that lease
-with heartbeats; if the heartbeat stops, the socket closes, or the maximum hold
-time is reached, the device releases the button on its own. The client is never
-trusted to release safely. See
-[architecture.md](docs/architecture.md) for the full model.
+A press starts a bounded "hold lease": the app must keep renewing that lease with
+`PRESS_RENEW` over TCP. If the renewals stop, the socket closes, or the maximum
+press duration is reached, the device releases the button on its own, and the
+client is never trusted to release safely. The UDP heartbeat is a **status
+channel only** and is deliberately **not** an input to the lease: it is lossy,
+unordered and unauthenticated, so it can never hold a press open. See
+[architecture.md](docs/architecture.md) and [protocol.md](docs/protocol.md) for
+the full model, with each rule marked implemented or planned.
 
-Of that model, **Phase 1 implements only the disconnect release**: closing the
-client connection while pressing releases the actuator. The lease, the maximum
-hold time and the watchdog arrive with the UDP heartbeat in a later phase, so
-today a client can hold the button for as long as it likes.
+Implemented today: the **disconnect release** (closing the owning connection
+while pressing releases the actuator), **exclusive session ownership** (only the
+connection that started a press may renew or stop it), the **lease timeout**
+(1000 ms without a valid renewal → release), the **maximum press duration**
+(3000 ms hard ceiling that no client message can extend), the **watchdog**
+enforcing both, and the **read-only UDP status channel** (heartbeats with
+sequence numbers and staleness detection). Authentication is not implemented,
+and the UDP datagrams are neither authenticated nor secure.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — components, layering,
-  networking topology, safety model, non-goals, open questions.
-- [docs/protocol.md](docs/protocol.md) — the draft wire protocol. Note that the
-  message names in Phase 1 differ from that draft (`PRESS_START` /
-  `PRESS_STOP` / `ACK` / `ERROR` instead of `press` / `release` / `state`);
-  the draft has not been updated to match yet.
+  networking topology, the TCP/UDP split and why UDP cannot touch the actuator,
+  the safety model, non-goals, open questions. Each layer and safety invariant is
+  marked implemented or planned.
+- [docs/protocol.md](docs/protocol.md) — the wire protocol. Sections 3–10
+  document the TCP command channel (`PRESS_START` / `PRESS_RENEW` /
+  `PRESS_STOP` / `ACK` / `ERROR`, JSON Lines framing, command and session ids,
+  error codes, and the press lease); section 11 documents the **implemented**
+  UDP heartbeat datagram (format, sequence numbers, stale detection, why it
+  cannot control the actuator, and its limitations); the handshake and
+  authentication are marked as **planned and not implemented**.
 
 ## License
 

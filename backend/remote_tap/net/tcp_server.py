@@ -32,13 +32,13 @@ logger = logging.getLogger(__name__)
 class ClientContext:
     """Per-connection bookkeeping.
 
-    Nothing here is shared between connections: it exists so that a disconnect
-    can be handled, and logged, without touching the shared session state.
+    The ``client_id`` is the connection's identity, and it is also what makes a
+    client the exclusive owner of a press session: the session layer compares it
+    to decide who may stop a press.
     """
 
     client_id: str
     peer: str
-    owned_session_id: str | None = None
 
 
 class TcpCommandServer:
@@ -198,7 +198,7 @@ class TcpCommandServer:
             return
 
         try:
-            response = await self._session.handle(command)
+            response = await self._session.handle(command, context.client_id)
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "[%s] failed to handle %s", context.client_id, command.type.value
@@ -211,13 +211,6 @@ class TcpCommandServer:
             )
             return
 
-        # Remember which session this connection is responsible for, so that a
-        # disconnect only releases the hold it actually owns.
-        active = self._session.active_session_id
-        context.owned_session_id = (
-            command.session_id if active == command.session_id else None
-        )
-
         logger.info(
             "[%s] %s command_id=%s session_id=%s -> %s",
             context.client_id,
@@ -229,18 +222,19 @@ class TcpCommandServer:
         await self._send(writer, response)
 
     async def _release_owned_session(self, context: ClientContext) -> None:
-        """Release the actuator if this connection owned the active hold."""
-        if context.owned_session_id is None:
-            return
-        released = await self._session.release_if_session(
-            context.owned_session_id, reason="client_disconnected"
+        """Release the actuator if this connection owned the active session.
+
+        The session layer decides ownership; a connection that never started a
+        press, or that lost the session to nobody, releases nothing.
+        """
+        released = await self._session.release_if_client(
+            context.client_id, reason="client_disconnected"
         )
         if released:
             logger.warning(
                 "[%s] released the actuator because the client disconnected",
                 context.client_id,
             )
-        context.owned_session_id = None
 
     # ------------------------------------------------------------------
     # Sending

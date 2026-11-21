@@ -13,6 +13,7 @@ from typing import Awaitable, Callable
 import pytest
 
 from remote_tap.actuator.simulator import SimulatedActuator
+from remote_tap.config import PressLimits, ServerConfig
 from remote_tap.net.tcp_server import TcpCommandServer
 from remote_tap.session import DeviceSession
 
@@ -53,7 +54,31 @@ async def test_press_start_is_acknowledged(
 
     response = await client.read_json()
 
-    assert response == {"type": "ACK", "command_id": "c1", "state": "PRESSING"}
+    # A successful press advertises the lease policy it runs under, so the
+    # client knows how often to renew without being told out of band.
+    assert response == {
+        "type": "ACK",
+        "command_id": "c1",
+        "state": "PRESSING",
+        "renew_interval_ms": 250,
+        "max_press_ms": 3000,
+    }
+    assert actuator.state.value == "PRESSING"
+
+
+async def test_press_renew_is_acknowledged(
+    client: RawClient, actuator: SimulatedActuator
+) -> None:
+    await client.send_json(command("PRESS_START", "c1"))
+    await client.read_json()
+
+    await client.send_json(command("PRESS_RENEW", "c2"))
+    response = await client.read_json()
+
+    assert response["type"] == "ACK"
+    assert response["command_id"] == "c2"
+    assert response["state"] == "PRESSING"
+    assert response["renew_interval_ms"] == 250
     assert actuator.state.value == "PRESSING"
 
 
@@ -232,12 +257,13 @@ async def test_the_server_keeps_serving_after_a_client_disconnects(
     client: RawClient,
     make_client: Callable[[], Awaitable[RawClient]],
 ) -> None:
-    await client.send_json(command("PRESS_START", "c1"))
+    await client.send_json(command("PRESS_START", "c1", SESSION_A))
     await client.read_json()
     await client.close()
 
+    # Reconnecting means starting a new session; the old session is gone.
     reconnect = await make_client()
-    await reconnect.send_json(command("PRESS_START", "c2"))
+    await reconnect.send_json(command("PRESS_START", "c2", SESSION_B))
 
     response = await reconnect.read_json()
 
@@ -245,17 +271,127 @@ async def test_the_server_keeps_serving_after_a_client_disconnects(
     assert response["state"] == "PRESSING"
 
 
-async def test_state_is_shared_across_connections(
+async def test_another_connection_cannot_stop_a_press_even_with_the_session_id(
     client: RawClient,
     make_client: Callable[[], Awaitable[RawClient]],
     session: DeviceSession,
+    actuator: SimulatedActuator,
 ) -> None:
-    other = await make_client()
-
     await client.send_json(command("PRESS_START", "c1", SESSION_A))
-    await client.read_json()
+    assert (await client.read_json())["state"] == "PRESSING"
 
-    assert session.state.value == "PRESSING"
-    # The second connection sees the same device state, without asking.
+    # A different connection that presents the correct session id is still not
+    # allowed to control the press: the creating connection is the only owner.
+    other = await make_client()
     await other.send_json(command("PRESS_STOP", "c2", SESSION_A))
-    assert (await other.read_json())["state"] == "IDLE"
+    error = await other.read_json()
+
+    assert error["type"] == "ERROR"
+    assert error["code"] == "INVALID_SESSION"
+    assert error["state"] == "PRESSING"
+    assert actuator.state.value == "PRESSING"
+    assert session.state.value == "PRESSING"
+
+
+async def test_another_connection_cannot_renew_a_press(
+    client: RawClient,
+    make_client: Callable[[], Awaitable[RawClient]],
+    actuator: SimulatedActuator,
+) -> None:
+    await client.send_json(command("PRESS_START", "c1", SESSION_A))
+    assert (await client.read_json())["state"] == "PRESSING"
+
+    # Knowing the session id is not enough: only the owning connection may keep
+    # the lease alive.
+    other = await make_client()
+    await other.send_json(command("PRESS_RENEW", "c2", SESSION_A))
+    error = await other.read_json()
+
+    assert error["type"] == "ERROR"
+    assert error["code"] == "INVALID_SESSION"
+    assert actuator.state.value == "PRESSING"
+
+    # The refusal did not disturb the owner's lease: it can still renew and stop.
+    await client.send_json(command("PRESS_RENEW", "c3", SESSION_A))
+    assert (await client.read_json())["state"] == "PRESSING"
+    await client.send_json(command("PRESS_STOP", "c4", SESSION_A))
+    assert (await client.read_json())["state"] == "IDLE"
+
+
+async def test_the_owner_can_still_stop_after_a_stranger_was_refused(
+    client: RawClient,
+    make_client: Callable[[], Awaitable[RawClient]],
+    actuator: SimulatedActuator,
+) -> None:
+    await client.send_json(command("PRESS_START", "c1", SESSION_A))
+    assert (await client.read_json())["state"] == "PRESSING"
+
+    other = await make_client()
+    await other.send_json(command("PRESS_STOP", "c2", SESSION_A))
+    assert (await other.read_json())["code"] == "INVALID_SESSION"
+
+    # The refusal must not have disturbed the owner's press.
+    await client.send_json(command("PRESS_STOP", "c3", SESSION_A))
+    assert (await client.read_json())["state"] == "IDLE"
+    assert actuator.state.value == "IDLE"
+
+
+# ----------------------------------------------------------------------
+# The press lease, over a real connection
+# ----------------------------------------------------------------------
+
+
+async def start_lease_server(limits: PressLimits):
+    """Start a server with custom press limits, to test the timings end to end."""
+    actuator = SimulatedActuator(label="lease")
+    session = DeviceSession(actuator, limits=limits)
+    server = TcpCommandServer(
+        session, ServerConfig(host="127.0.0.1", port=0), name="lease-server"
+    )
+    await server.start()
+    assert server.port is not None
+    return session, actuator, server
+
+
+async def test_the_lease_releases_the_actuator_when_the_client_goes_quiet() -> None:
+    limits = PressLimits(renew_interval_ms=10, lease_timeout_ms=60, max_press_ms=2000)
+    session, actuator, server = await start_lease_server(limits)
+    try:
+        client = await RawClient.connect("127.0.0.1", server.port)
+        try:
+            await client.send_json(command("PRESS_START", "c1"))
+            assert (await client.read_json())["state"] == "PRESSING"
+
+            # The connection stays open, but the client stops renewing: the
+            # device must let go on its own rather than wait for the client.
+            assert await wait_until(lambda: actuator.state.value == "IDLE", timeout=2.0)
+            assert session.active_session_id is None
+        finally:
+            await client.close()
+    finally:
+        await session.release(reason="test_teardown")
+        await server.stop()
+
+
+async def test_renewals_keep_the_press_alive_past_the_lease_timeout() -> None:
+    limits = PressLimits(renew_interval_ms=10, lease_timeout_ms=80, max_press_ms=2000)
+    session, actuator, server = await start_lease_server(limits)
+    try:
+        client = await RawClient.connect("127.0.0.1", server.port)
+        try:
+            await client.send_json(command("PRESS_START", "c1"))
+            await client.read_json()
+
+            # Renew well past several lease timeouts: the press must survive.
+            for index in range(10):
+                await asyncio.sleep(0.02)
+                await client.send_json(command("PRESS_RENEW", f"r{index}"))
+                assert (await client.read_json())["state"] == "PRESSING"
+
+            assert actuator.state.value == "PRESSING"
+            assert session.active_session_id == SESSION_A
+        finally:
+            await client.close()
+    finally:
+        await session.release(reason="test_teardown")
+        await server.stop()
