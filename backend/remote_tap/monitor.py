@@ -14,6 +14,14 @@ It shows:
 * when the last valid datagram arrived,
 * and the device going **offline** when heartbeats stop.
 
+Sequence tracking is keyed on ``(device_id, boot_id)`` rather than the device
+alone. The device's sequence number restarts at 1 whenever its process restarts,
+so a monitor that remembered only "device X was at sequence 500" would misread a
+restarted device's fresh sequence as a flood of out-of-order packets. The boot id
+marks each run of the service: when a known device reports a new boot id, the
+monitor recognises a restart, resets that device's sequence tracking and ignores
+any late datagram still carrying the *previous* boot id.
+
 It deliberately reads nothing but the datagram: this client cannot command the
 device, and a malformed or unsupported datagram is reported and dropped rather
 than crashing the loop.
@@ -53,6 +61,8 @@ class DatagramKind(str, Enum):
     DUPLICATE = "duplicate"
     #: An older sequence number than the one already displayed.
     OUT_OF_ORDER = "out_of_order"
+    #: From a boot that a newer boot has already replaced; ignored.
+    SUPERSEDED = "superseded"
     #: Malformed, or a message this client does not understand.
     REJECTED = "rejected"
 
@@ -66,13 +76,32 @@ class MonitorEvent:
     #: How many datagrams were missing immediately before an accepted one.
     missing: int = 0
     message: str = ""
+    #: The boot id the datagram carried, when it could be parsed.
+    boot_id: str | None = None
+    #: True when this datagram came from a boot never seen for its device, i.e.
+    #: the device looks like it restarted.
+    restarted: bool = False
+
+
+@dataclass
+class _InstanceTracker:
+    """Sequence bookkeeping for one ``(device_id, boot_id)`` run of a device."""
+
+    last_sequence: int
+    last_status: StatusDatagram
+    #: Set once a *newer* boot for the same device has been accepted, so late
+    #: datagrams still carrying this old boot id can be ignored outright.
+    superseded: bool = False
 
 
 class StatusMonitor:
     """Tracks the newest status seen and whether the device is still sending.
 
-    Kept free of sockets so its logic (ordering, duplicates, staleness) can be
-    tested with an injected clock and hand-built datagrams.
+    Kept free of sockets so its logic (ordering, duplicates, restarts,
+    staleness) can be tested with an injected clock and hand-built datagrams.
+
+    Sequence state is kept per ``(device_id, boot_id)``, so several devices — and
+    several runs of one device — are tracked independently.
 
     Args:
         stale_after_ms: how long without a datagram before the device is
@@ -92,15 +121,25 @@ class StatusMonitor:
         self._stale_after = stale_after_ms / 1000.0
         self._clock = clock
         self._expected_device_id = expected_device_id
+        #: The most recently accepted datagram and its sequence — the status the
+        #: monitor is currently displaying.
         self.last_status: StatusDatagram | None = None
         self.last_sequence: int | None = None
         self.last_seen: float | None = None
+        self.last_device_id: str | None = None
+        self.last_boot_id: str | None = None
         self.accepted = 0
         self.duplicates = 0
         self.out_of_order = 0
+        self.superseded = 0
+        self.restarts = 0
         self.rejected = 0
         self.missing = 0
         self._offline_reported = False
+        #: Sequence state per ``(device_id, boot_id)``.
+        self._instances: dict[tuple[str, str], _InstanceTracker] = {}
+        #: The boot id currently believed to be the live run of each device.
+        self._current_boot: dict[str, str] = {}
 
     def observe(self, data: bytes, *, now: float | None = None) -> MonitorEvent:
         """Classify one inbound datagram and update the displayed status."""
@@ -120,7 +159,24 @@ class StatusMonitor:
             return MonitorEvent(
                 DatagramKind.REJECTED,
                 sequence=message.sequence,
+                boot_id=message.boot_id,
                 message=f"unexpected device id {message.device_id!r}",
+            )
+
+        key = (message.device_id, message.boot_id)
+        tracker = self._instances.get(key)
+
+        # A datagram from a boot that a newer one has already replaced is stale
+        # by definition: it is dropped before it can touch liveness or status.
+        # This is what stops a previous process's late packets — whatever their
+        # sequence number — from overwriting the current device status.
+        if tracker is not None and tracker.superseded:
+            self.superseded += 1
+            return MonitorEvent(
+                DatagramKind.SUPERSEDED,
+                sequence=message.sequence,
+                boot_id=message.boot_id,
+                message=f"superseded by boot {self._current_boot.get(message.device_id)!r}",
             )
 
         # Whatever the sequence says, the device is clearly still alive, so the
@@ -128,27 +184,75 @@ class StatusMonitor:
         self.last_seen = now
         self._offline_reported = False
 
-        if self.last_sequence is not None and message.sequence <= self.last_sequence:
-            if message.sequence == self.last_sequence:
-                self.duplicates += 1
-                return MonitorEvent(DatagramKind.DUPLICATE, sequence=message.sequence)
+        if tracker is None:
+            return self._accept_new_instance(message)
+
+        if message.sequence == tracker.last_sequence:
+            self.duplicates += 1
+            return self._ignored(DatagramKind.DUPLICATE, message)
+        if message.sequence < tracker.last_sequence:
             self.out_of_order += 1
-            return MonitorEvent(
+            return self._ignored(
                 DatagramKind.OUT_OF_ORDER,
-                sequence=message.sequence,
-                message=f"newest is {self.last_sequence}",
+                message,
+                detail=f"newest is {tracker.last_sequence}",
             )
 
-        missing = (
-            0
-            if self.last_sequence is None
-            else message.sequence - self.last_sequence - 1
+        missing = message.sequence - tracker.last_sequence - 1
+        tracker.last_sequence = message.sequence
+        tracker.last_status = message
+        return self._accept(message, missing=missing)
+
+    def _accept_new_instance(self, message: StatusDatagram) -> MonitorEvent:
+        """Register a first-seen boot for a device and display its datagram.
+
+        A boot id the monitor has not seen for this device is treated as a fresh
+        run: its sequence tracking starts here, so its sequence 1 is accepted
+        rather than mistaken for an out-of-order packet from the previous run.
+        """
+        previous_boot = self._current_boot.get(message.device_id)
+        restarted = previous_boot is not None and previous_boot != message.boot_id
+        if restarted:
+            previous = self._instances.get((message.device_id, previous_boot))
+            if previous is not None:
+                previous.superseded = True
+            self.restarts += 1
+        self._current_boot[message.device_id] = message.boot_id
+        self._instances[(message.device_id, message.boot_id)] = _InstanceTracker(
+            last_sequence=message.sequence, last_status=message
         )
+        return self._accept(message, missing=0, restarted=restarted)
+
+    def _accept(
+        self,
+        message: StatusDatagram,
+        *,
+        missing: int,
+        restarted: bool = False,
+    ) -> MonitorEvent:
+        """Display ``message`` as the newest status and count the acceptance."""
         self.missing += missing
         self.last_sequence = message.sequence
         self.last_status = message
+        self.last_device_id = message.device_id
+        self.last_boot_id = message.boot_id
         self.accepted += 1
-        return MonitorEvent(DatagramKind.ACCEPTED, sequence=message.sequence, missing=missing)
+        return MonitorEvent(
+            DatagramKind.ACCEPTED,
+            sequence=message.sequence,
+            missing=missing,
+            boot_id=message.boot_id,
+            restarted=restarted,
+        )
+
+    @staticmethod
+    def _ignored(
+        kind: DatagramKind, message: StatusDatagram, *, detail: str = ""
+    ) -> MonitorEvent:
+        """Build an event for a datagram that is not allowed to change status."""
+        return MonitorEvent(
+            kind, sequence=message.sequence, message=detail, boot_id=message.boot_id
+        )
 
     def age(self, *, now: float | None = None) -> float | None:
         """Seconds since the last datagram, or ``None`` if there has been none."""
@@ -193,10 +297,23 @@ class _MonitorProtocol(asyncio.DatagramProtocol):
         logger.warning("UDP receive error: %s", exc)
 
 
+def _short_boot(boot_id: str | None) -> str:
+    """Abbreviate a boot id for console output (the full value is long)."""
+    if not boot_id:
+        return "unknown"
+    return boot_id[:8]
+
+
 def format_event(addr: object, event: MonitorEvent, monitor: StatusMonitor) -> str:
     """Render one observed datagram as a line of console output."""
     if event.kind is DatagramKind.REJECTED:
         return f"[monitor] rejected datagram from {addr}: {event.message}"
+
+    if event.kind is DatagramKind.SUPERSEDED:
+        return (
+            f"[monitor] seq={event.sequence} from an earlier boot "
+            f"(boot={_short_boot(event.boot_id)}) ignored; {event.message}"
+        )
 
     if event.kind is DatagramKind.DUPLICATE:
         return (
@@ -215,8 +332,10 @@ def format_event(addr: object, event: MonitorEvent, monitor: StatusMonitor) -> s
     line = (
         f"[monitor] seq={status.sequence} type={status.type} state={status.state} "
         f"session_active={'yes' if status.session_active else 'no'} "
-        f"device={status.device_id} from {addr}"
+        f"device={status.device_id} boot={_short_boot(status.boot_id)} from {addr}"
     )
+    if event.restarted:
+        line += "  !! new boot id: the device restarted, sequence tracking reset"
     if event.missing:
         line += f"  !! {event.missing} heartbeat(s) missing before this one"
     return line

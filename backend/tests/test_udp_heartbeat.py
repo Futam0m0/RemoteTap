@@ -319,6 +319,59 @@ async def test_the_monitoring_client_interprets_a_real_heartbeat_stream(
     assert monitor.is_offline() is False
 
 
+async def test_the_boot_id_is_constant_for_one_service_instance(
+    udp_recorder: UdpRecorder, make_heartbeat: HeartbeatFactory
+) -> None:
+    service = await make_heartbeat(udp_recorder)
+    await service.start()
+    assert await udp_recorder.wait_for(3)
+
+    boot_ids = {parse_datagram(data).boot_id for data in udp_recorder.datagrams[:3]}
+    assert len(boot_ids) == 1, "the boot id changed during one service run"
+    assert boot_ids == {service.boot_id}
+    assert service.boot_id  # non-empty
+
+
+async def test_a_restarted_service_generates_a_new_boot_id(
+    session: DeviceSession, udp_recorder: UdpRecorder
+) -> None:
+    # A restart is a new service instance — the application builds exactly one
+    # per process run — so two instances must not share a boot id. The device
+    # id stays the same, which is what makes the new boot id meaningful.
+    config = make_config(udp_recorder)
+    first = HeartbeatService(session, config)
+    second = HeartbeatService(session, config)
+
+    assert first.boot_id != second.boot_id
+
+
+async def test_a_real_service_restart_is_recognised_by_the_monitor(
+    udp_recorder: UdpRecorder, make_heartbeat: HeartbeatFactory
+) -> None:
+    first = await make_heartbeat(udp_recorder, interval_ms=20)
+    await first.start()
+    assert await udp_recorder.wait_for(2)
+    await first.stop()
+
+    second = await make_heartbeat(udp_recorder, interval_ms=20)
+    await second.start()
+    # Wait for a datagram from the *new* boot, so the restart has certainly
+    # happened by the time the recorded stream is replayed.
+    await wait_for_datagram(udp_recorder, lambda m: m.boot_id == second.boot_id)
+    await second.stop()
+
+    assert first.boot_id != second.boot_id
+
+    monitor = StatusMonitor(stale_after_ms=5000, expected_device_id=DEFAULT_DEVICE_ID)
+    events = [monitor.observe(data) for data in udp_recorder.datagrams]
+
+    assert any(event.restarted for event in events)
+    assert monitor.restarts == 1
+    # The new boot's sequence 1 is accepted, not mistaken for out-of-order.
+    assert monitor.out_of_order == 0
+    assert monitor.superseded == 0
+
+
 # ----------------------------------------------------------------------
 # Failure handling
 # ----------------------------------------------------------------------

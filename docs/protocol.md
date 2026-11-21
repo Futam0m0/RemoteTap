@@ -409,19 +409,26 @@ used twice.
 One JSON object per datagram, UTF-8, no newline and no framing of any kind.
 
 ```json
-{"v":1,"type":"heartbeat","device_id":"remotetap-01","seq":42,"ts":1763612400123,"status":"ok","state":"IDLE","session_active":false}
+{"v":1,"type":"heartbeat","device_id":"remotetap-01","boot_id":"5f3c9a1e7b2d4c8f9a0e1b2c3d4e5f60","seq":42,"ts":1763612400123,"status":"ok","state":"IDLE","session_active":false}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `v` | integer | Protocol version of this datagram format. Currently `1`. |
 | `type` | string | `"heartbeat"` (a periodic liveness tick) or `"status"` (the device noticed its own state changed). |
-| `device_id` | string | Which device sent this; lets one monitor watch several. Configured with `--device-id` (default `remotetap-01`). |
-| `seq` | integer | 1-based sequence number, incremented for every datagram the device actually sends. |
+| `device_id` | string | Which device sent this; lets one monitor watch several. Configured with `--device-id` (default `remotetap-01`). **Stable across restarts.** |
+| `boot_id` | string | Identifies one **run** of the device service (32 hex characters). Generated fresh when the service starts and constant for that run, so it changes after a device restart. See section 11.3. |
+| `seq` | integer | 1-based sequence number, incremented for every datagram the device actually sends. **Restarts at `1`** when the service restarts. |
 | `ts` | integer | Sender's wall-clock time in milliseconds. **Display only** — see section 11.5. |
 | `status` | string | The device's own service status. Today the only value is `"ok"`. |
 | `state` | string | Actuator state: `"IDLE"` or `"PRESSING"`. |
 | `session_active` | boolean | Whether a press session is currently active. |
+
+`device_id` names the *device*; `boot_id` names the *run*. The device id is the
+same every time the device starts, which is exactly why the boot id is needed:
+without it, a restarted device's fresh `seq = 1` is indistinguishable from a very
+old packet (section 11.3). The `ts` is **not** used as a substitute for boot
+identity — clocks are unsynchronised (section 11.5).
 
 `type` distinguishes the two message types:
 
@@ -436,21 +443,39 @@ One JSON object per datagram, UTF-8, no newline and no framing of any kind.
 Both types carry the same fields and the same meaning; `type` only tells the
 receiver *why* it was sent.
 
-### 11.3 Sequence numbers and freshness
+### 11.3 Sequence numbers, boot ids and freshness
 
-* `seq` starts at `1` and increases by exactly one for each datagram the device
-  hands to the OS. A send that **fails** is not counted, so a failed send does
-  not leave a gap that looks like packet loss.
-* A receiver remembers the highest `seq` it has accepted and classifies each
-  datagram that arrives:
-  * `seq > last` → **accepted**; any numbers skipped are counted as missing
-    (`missing = seq - last - 1`), because UDP may have dropped them or reordered
-    them;
-  * `seq == last` → **duplicate**, ignored so it cannot overwrite the displayed
-    status with an older copy;
-  * `seq < last` → **out of order** (a late datagram), ignored.
-* Receiving a duplicate or out-of-order datagram still proves the device is
-  alive, so any "last seen" timer is reset even when the payload is ignored.
+* `seq` starts at `1` **for each run of the service** and increases by exactly
+  one for each datagram the device hands to the OS. A send that **fails** is not
+  counted, so a failed send does not leave a gap that looks like packet loss.
+* `boot_id` identifies that run. It is generated once when the service starts —
+  a fresh 32-character hex id — and never changes while the process lives, so a
+  restarted device is always a *different* boot id (section 11.2).
+* A receiver keys its sequence bookkeeping on the pair **`(device_id, boot_id)`**,
+  not on the device id alone. For a datagram that arrives:
+  * **same boot, `seq > last`** → **accepted**; any numbers skipped are counted
+    as missing (`missing = seq - last - 1`), because UDP may have dropped or
+    reordered them;
+  * **same boot, `seq == last`** → **duplicate**, ignored so it cannot overwrite
+    the displayed status with an older copy;
+  * **same boot, `seq < last`** → **out of order** (a late datagram), ignored;
+  * **a boot id not seen before for that device** → the device **restarted**. The
+    receiver starts fresh sequence tracking for the new boot, so the restarted
+    device's `seq = 1` is **accepted** rather than misread as a flood of
+    out-of-order packets. The boot it was watching before is marked
+    **superseded**: any late datagram still carrying that old boot id is ignored
+    outright — whatever its sequence number — so a previous process's packets
+    cannot overwrite the current device status.
+
+  The boot-id rule is the fix for the restart problem: a monitor that remembered
+  only "device `remotetap-01` is at sequence 500" would reject the restarted
+  device's whole fresh sequence. Keying on `(device_id, boot_id)` makes a restart
+  a clean, recognisable event instead.
+
+* Receiving a duplicate or out-of-order datagram from the **current** boot still
+  proves the device is alive, so the "last seen" timer is reset even when the
+  payload is ignored. A **superseded** datagram does not, because the boot that
+  sent it has already gone.
 
 **Stale detection is measured by the receiver, with its own monotonic clock.**
 The datagram's `ts` is never used for it (section 11.5). If nothing valid has
@@ -459,6 +484,19 @@ arrived for longer than the stale timeout the monitor shows the device as
 valid datagram. The stale timeout defaults to 3000 ms and must be at least twice
 the heartbeat interval, so a single lost heartbeat cannot make a healthy device
 look offline.
+
+**What is guaranteed, and what is not.** Without authentication (section 12) the
+boot id is a *correlation* identifier, not a credential:
+
+* Within a single observed run the receiver reliably tells a restart from
+  reordering, and it ignores late packets from a boot it has already replaced —
+  that does not depend on the sender being honest.
+* But a boot id the receiver has **never seen** cannot be distinguished from a
+  restart. A forged or long-delayed datagram that carries an unknown boot id is
+  treated as a new instance and may become the currently displayed status. This
+  is unavoidable while datagrams are unauthenticated, and is why the status
+  channel must never be trusted for anything that matters — it never influences
+  the actuator in any case (section 11.4).
 
 ### 11.4 Why UDP cannot control the actuator
 
@@ -494,6 +532,11 @@ deadline or the watchdog deadline.
   machinery for routine beats.
 * **Blocked UDP is silent.** A firewall that drops UDP looks exactly like a dead
   device; the monitor will report the device as offline even though TCP works.
+* **Boot ids identify runs, not identities.** A `boot_id` lets a receiver spot a
+  restarted device and ignore its previous run's late packets, but it is not a
+  credential: a receiver cannot prove a datagram really came from the boot it
+  names, and a datagram carrying an unknown boot id is indistinguishable from a
+  restart (section 11.3).
 * **Size.** A datagram is a few hundred bytes at most. The receiver rejects
   anything above 512 bytes as malformed rather than trying to reassemble it.
 * **No authentication or encryption.** See the note at the top of this document
@@ -509,9 +552,12 @@ python -m remote_tap.monitor --host 0.0.0.0 --port 8766
 ```
 
 It prints each datagram it accepts (sequence number, type, actuator state,
-session flag, sender), reports gaps in the sequence, names duplicate and
-out-of-order datagrams, and prints a single "device OFFLINE" line when
-heartbeats stop arriving. It cannot command the device.
+session flag, device id, a short form of the boot id and the sender), reports
+gaps in the sequence, names duplicate, out-of-order and superseded datagrams, and
+prints a single "device OFFLINE" line when heartbeats stop arriving. When a
+datagram arrives with a boot id it has not seen before for that device, it notes
+that the **device restarted** and restarts that device's sequence tracking. It
+cannot command the device.
 
 ---
 

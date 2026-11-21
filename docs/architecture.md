@@ -11,9 +11,10 @@
 >   actuator when either deadline is reached. All three values are configurable
 >   in one place.
 > * **Implemented (Phase 3 status)**: the UDP heartbeat / status channel — a
->   device-to-monitor, read-only status stream with sequence numbers, duplicate
->   and reordering handling, and staleness detection in the monitoring client.
->   It cannot influence the actuator, the lease or the watchdog.
+>   device-to-monitor, read-only status stream with sequence numbers, a
+>   per-run **boot id**, duplicate and reordering handling, restart detection,
+>   and staleness detection in the monitoring client. It cannot influence the
+>   actuator, the lease or the watchdog.
 > * **Planned (authentication)**: the handshake and shared-secret auth —
 >   **not implemented**. Neither channel is authenticated today.
 > * **Future (hardware)**: Raspberry Pi GPIO / servo integration — **not
@@ -164,7 +165,17 @@ Implemented UDP status values:
 | Stale / offline timeout | 3000 ms | Three missed heartbeats before a monitor calls the device offline; must be at least twice the interval |
 | Monitoring-client port | 8766 | The monitor listens here; the device sends from an ephemeral source port |
 | Device bind | `127.0.0.1`, port `0` (ephemeral) | Outbound-only socket: no listening UDP port, no UDP input accepted |
-| Device id | `remotetap-01` | Lets one monitor watch several devices later |
+| Device id | `remotetap-01` | Lets one monitor watch several devices later; **stable across restarts** |
+| Boot id | A fresh 32-character hex string per service run (stdlib `uuid.uuid4().hex`) | Names this *run* of the service; a new value tells the monitor the device restarted and its sequence counter reset |
+
+The **boot id** is the answer to a specific problem: the sequence number restarts
+at `1` on every process start, so a monitor that tracked sequence alone would
+read a restarted device's first datagram as "out of order" (it previously saw
+`500`). The device therefore stamps every datagram with a boot id that is
+constant for the lifetime of the heartbeat service and changes only when the
+process (re)starts. The monitor keys its sequence state on
+`(device_id, boot_id)`, so a new boot id starts a fresh sequence stream rather
+than colliding with the old one. See section 4.2.
 
 ### 4.1 Why the UDP channel cannot affect the actuator
 
@@ -195,6 +206,58 @@ What this guarantees, matching the Phase 3 requirements:
 * A UDP failure cannot disable TCP command handling, and a broken UDP channel
   does not affect the shutdown release order (the actuator is still released
   before the TCP server stops).
+
+### 4.2 Recognising a restarted device
+
+Sequence numbers are only meaningful *within one run* of the device. Because the
+counter restarts at `1`, the monitor cannot compare a datagram against the last
+one it saw without first knowing whether the two came from the same run. The
+**boot id** supplies that context.
+
+**Device side.** `HeartbeatService` (`net/udp_heartbeat.py`) generates one boot id
+when it is constructed — a stdlib `uuid.uuid4().hex` — stores it on the instance,
+and includes it in the `boot_id` field of every heartbeat and status datagram.
+It is never regenerated for the lifetime of the service, so every datagram from
+one run carries the same boot id. The `device_id` is deliberately left unchanged:
+it names the *device*, while the boot id names the *run*. The `ts` timestamp is
+**not** used as a boot identity — a clock can jump backwards or forwards, and two
+runs can share a timestamp.
+
+**Monitor side.** `StatusMonitor` (`monitor.py`) keeps a small tracker per
+`(device_id, boot_id)` pair and a `_current_boot` map from device to its live
+boot id. When a datagram arrives:
+
+1. It is parsed and filtered against the expected device ids (unchanged from
+   Phase 3: an unexpected device is ignored).
+2. If the `(device_id, boot_id)` pair has no tracker, this is the **first
+   datagram of a run**. If the monitor already held a *different* boot id for
+   that device, it has just seen a **restart**: the old boot's tracker is marked
+   `superseded`, a restart is counted, and the reported line is flagged. A
+   brand-new device (no previous boot) is just a first sighting, not a restart.
+   Either way, a fresh tracker is created with the new sequence.
+3. If a tracker exists but is `superseded`, the datagram is dropped as
+   `SUPERSEDED` regardless of its sequence number. This is what stops an old
+   boot's late packet from overwriting the current status or keeping the device
+   "alive".
+4. Otherwise the sequence is compared **within the same boot**: equal →
+   `DUPLICATE`, lower → `OUT_OF_ORDER` (the displayed status is never rewound),
+   higher → `ACCEPTED`, with the gap counted as missing heartbeats.
+
+So a restarted device's sequence `1` is `ACCEPTED` (a new boot), whereas a
+sequence below the current boot's high-water mark is `OUT_OF_ORDER`, and a repeat
+of the latest sequence is a `DUPLICATE`. Staleness and the once-per-outage
+offline notice are unchanged: they still run off the receiver's own monotonic
+clock, never the sender's `ts`.
+
+**What this does and does not guarantee.** Restart detection is a *correlation*
+mechanism, not a security one. Without authentication, "a boot id I have not seen
+before" is indistinguishable from a forged datagram or a first contact, so the
+monitor treats an unknown boot id as a new run. Nothing stops an attacker who can
+reach the UDP port from sending a datagram with a fresh boot id and a high
+sequence; at most this misleads a *monitor*'s display. It cannot touch the
+actuator, the lease or the watchdog, because the UDP path has no route into the
+session (section 4.1). Authenticating datagrams is deferred to the
+authentication phase.
 
 ## 5. Safety model
 
@@ -363,7 +426,7 @@ mobile/                  # PLANNED (later phase) - does not exist yet
 
 ## 9. Testing strategy
 
-Implemented tests (176, all passing) cover Phase 1, the Phase 2 lease and the
+Implemented tests (195, all passing) cover Phase 1, the Phase 2 lease and the
 Phase 3 UDP status channel:
 
 - **Protocol** (`tests/test_protocol.py`): encode/decode round-trips, malformed
@@ -400,7 +463,14 @@ Phase 3 UDP status channel:
   in-order acceptance, gap counting, duplicate and out-of-order rejection that
   never rewinds the displayed status, rejection of another device's datagrams,
   staleness at the timeout boundary, the once-per-outage offline notice, and that
-  staleness uses the receiver's clock rather than the sender's `ts`.
+  staleness uses the receiver's clock rather than the sender's `ts`. The restart
+  cases use a pinned boot id: a first sighting is not a restart, a new boot id is
+  recognised as one, a restarted device's sequence `1` is accepted, an old
+  sequence within the *current* boot is still out of order, duplicates are
+  duplicates within one boot, a late datagram from a superseded boot is ignored
+  (and does not keep the device alive), and two devices are tracked
+  independently — plus a boot id that must be a non-empty string and must
+  round-trip unchanged.
 - **UDP heartbeat and isolation** (`tests/test_udp_heartbeat.py`): against a real
   UDP socket — heartbeats sent at the configured interval (and a long interval
   honoured after the immediate first beat), sequence numbers incrementing by one,
@@ -412,7 +482,10 @@ Phase 3 UDP status channel:
   straight at the device socket cannot initiate, stop or renew a press, cannot
   move the lease deadline (while a TCP renewal can), stopping the UDP channel
   does not release a press, and breaking the UDP channel mid-run does not stop
-  TCP command handling.
+  TCP command handling. The boot id is checked here too: it stays constant for
+  the life of one service instance, a second instance generates a different one,
+  and a real stop/start pair of services is recognised by the monitor as a single
+  restart with no out-of-order or superseded events.
 
 Timing tests use short, injected `PressLimits` / `UdpConfig` and an injectable
 monotonic clock rather than real sleeps, so the whole suite runs in a few

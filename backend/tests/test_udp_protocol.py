@@ -31,6 +31,7 @@ def heartbeat(**overrides: object) -> StatusDatagram:
     fields: dict[str, object] = {
         "type": HEARTBEAT,
         "device_id": "remotetap-01",
+        "boot_id": "boot-a",
         "sequence": 1,
         "timestamp_ms": 1_700_000_000_000,
         "state": "IDLE",
@@ -64,6 +65,7 @@ def test_the_wire_format_uses_the_documented_short_field_names() -> None:
         "v": UDP_PROTOCOL_VERSION,
         "type": HEARTBEAT,
         "device_id": "remotetap-01",
+        "boot_id": "boot-a",
         "seq": 1,
         "ts": 1_700_000_000_000,
         "status": STATUS_OK,
@@ -81,7 +83,12 @@ def test_a_datagram_is_a_single_json_object_with_no_newline() -> None:
 def test_a_datagram_stays_small() -> None:
     # The receiver accepts at most MAX_DATAGRAM_BYTES; a real datagram should be
     # far smaller, because UDP fragments or drops anything that does not fit.
-    assert len(encode_datagram(heartbeat())) < 256
+    # A real 32-character hex boot id is used, not a short test stub.
+    datagram = encode_datagram(
+        heartbeat(boot_id="9f2c4d1e5a6b7c8d9e0f1a2b3c4d5e6f")
+    )
+    assert len(datagram) < 256
+    assert len(datagram) < MAX_DATAGRAM_BYTES
 
 
 def test_both_a_heartbeat_and_a_status_report_parse() -> None:
@@ -121,7 +128,9 @@ def test_an_oversized_datagram_is_rejected_without_being_parsed() -> None:
     assert caught.value.code is DatagramErrorCode.MALFORMED
 
 
-@pytest.mark.parametrize("field", ["v", "type", "seq", "state", "session_active"])
+@pytest.mark.parametrize(
+    "field", ["v", "type", "seq", "state", "session_active", "boot_id"]
+)
 def test_every_required_field_is_required(field: str) -> None:
     payload = heartbeat().to_dict()
     del payload[field]
@@ -181,6 +190,21 @@ def test_a_blank_device_id_is_rejected() -> None:
     assert caught.value.code is DatagramErrorCode.INVALID_FIELD
 
 
+@pytest.mark.parametrize("boot_id", ["", "   ", 5, None, ["b"]])
+def test_an_invalid_boot_id_is_rejected(boot_id: object) -> None:
+    with pytest.raises(DatagramError) as caught:
+        parse_datagram(wire(**{"boot_id": boot_id}))
+    assert caught.value.code in (
+        DatagramErrorCode.INVALID_FIELD,
+        DatagramErrorCode.MISSING_FIELD,
+    )
+
+
+def test_a_boot_id_round_trips_unchanged() -> None:
+    original = heartbeat(boot_id="9f2c4d1e5a6b7c8d9e0f1a2b3c4d5e6f")
+    assert parse_datagram(encode_datagram(original)).boot_id == original.boot_id
+
+
 def test_an_optional_status_field_falls_back_to_ok() -> None:
     payload = heartbeat().to_dict()
     del payload["status"]
@@ -212,7 +236,14 @@ class FakeClock:
         self.now += seconds
 
 
-def beat(sequence: int, *, state: str = "IDLE", active: bool = False) -> bytes:
+def beat(
+    sequence: int,
+    *,
+    state: str = "IDLE",
+    active: bool = False,
+    boot_id: str = "boot-a",
+    device_id: str = "remotetap-01",
+) -> bytes:
     """Encode a heartbeat datagram with the given sequence number."""
     return encode_datagram(
         heartbeat(
@@ -220,6 +251,8 @@ def beat(sequence: int, *, state: str = "IDLE", active: bool = False) -> bytes:
             sequence=sequence,
             state=state,
             session_active=active,
+            boot_id=boot_id,
+            device_id=device_id,
         )
     )
 
@@ -329,6 +362,122 @@ def test_a_duplicate_still_proves_the_device_is_alive() -> None:
 
 
 # ----------------------------------------------------------------------
+# Restart detection: sequence tracking is keyed by (device_id, boot_id)
+# ----------------------------------------------------------------------
+
+
+def test_the_first_datagram_from_a_device_is_not_a_restart() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    event = monitor.observe(beat(1))
+    assert event.kind is DatagramKind.ACCEPTED
+    assert event.restarted is False
+    assert monitor.restarts == 0
+
+
+def test_a_restart_is_recognised_by_a_new_boot_id() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    for sequence in range(1, 501):
+        monitor.observe(beat(sequence))
+    assert monitor.last_sequence == 500
+    assert monitor.accepted == 500
+
+    # The device restarts: the device id is unchanged, but the boot id is fresh
+    # and the sequence number is back to 1.
+    event = monitor.observe(beat(1, boot_id="boot-b"))
+    assert event.kind is DatagramKind.ACCEPTED
+    assert event.restarted is True
+    assert event.missing == 0
+    assert monitor.last_sequence == 1
+    assert monitor.last_boot_id == "boot-b"
+    assert monitor.restarts == 1
+
+
+def test_a_restarted_device_sequence_one_is_not_out_of_order() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    monitor.observe(beat(500))
+    event = monitor.observe(beat(1, boot_id="boot-b"))
+    assert event.kind is DatagramKind.ACCEPTED
+    assert monitor.out_of_order == 0
+
+
+def test_a_late_datagram_from_the_replaced_boot_is_ignored() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    for sequence in (1, 2, 3):
+        monitor.observe(beat(sequence, state="PRESSING", active=True))
+    # The device restarts; the new boot reports the actuator idle.
+    monitor.observe(beat(1, boot_id="boot-b"))
+
+    # A datagram from the old boot arrives late. Even a higher sequence number
+    # must not overwrite the current status.
+    event = monitor.observe(beat(4, boot_id="boot-a", state="PRESSING", active=True))
+    assert event.kind is DatagramKind.SUPERSEDED
+    assert monitor.superseded == 1
+    assert monitor.last_boot_id == "boot-b"
+    assert monitor.last_sequence == 1
+    assert monitor.last_status is not None
+    assert monitor.last_status.state == "IDLE"
+
+
+def test_a_superseded_datagram_does_not_keep_the_device_alive() -> None:
+    clock = FakeClock()
+    monitor = StatusMonitor(1000, clock=clock)
+    monitor.observe(beat(1, boot_id="boot-a"), now=clock())
+    monitor.observe(beat(1, boot_id="boot-b"), now=clock())  # A restart.
+
+    clock.advance(1.5)  # The live boot has gone quiet: past the stale timeout.
+    assert monitor.is_offline(now=clock()) is True
+
+    # A late packet from the dead boot must not clear the outage.
+    event = monitor.observe(beat(9, boot_id="boot-a"), now=clock())
+    assert event.kind is DatagramKind.SUPERSEDED
+    assert monitor.is_offline(now=clock()) is True
+
+
+def test_old_sequence_numbers_within_the_current_boot_stay_out_of_order() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    for sequence in (1, 2, 3):
+        monitor.observe(beat(sequence, boot_id="boot-b"))
+    event = monitor.observe(beat(2, boot_id="boot-b"))
+    assert event.kind is DatagramKind.OUT_OF_ORDER
+    assert monitor.out_of_order == 1
+    assert monitor.last_sequence == 3
+
+
+def test_duplicates_are_counted_within_the_same_boot() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    monitor.observe(beat(1, boot_id="boot-b"))
+    monitor.observe(beat(2, boot_id="boot-b"))
+    event = monitor.observe(beat(2, boot_id="boot-b"))
+    assert event.kind is DatagramKind.DUPLICATE
+    assert monitor.duplicates == 1
+    assert monitor.last_sequence == 2
+
+
+def test_two_devices_are_tracked_independently() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    for sequence in (1, 2, 3):
+        event = monitor.observe(beat(sequence, device_id="device-a", boot_id="a1"))
+        assert event.kind is DatagramKind.ACCEPTED
+
+    # A second device starts at sequence 1; it must not look out of order even
+    # though the first device is already at 3.
+    event = monitor.observe(beat(1, device_id="device-b", boot_id="b1"))
+    assert event.kind is DatagramKind.ACCEPTED
+    assert event.missing == 0
+    assert event.restarted is False  # A different device, not a reboot.
+    assert monitor.out_of_order == 0
+
+    # Both continue independently, each keeping its own sequence.
+    a_next = monitor.observe(beat(4, device_id="device-a", boot_id="a1"))
+    b_next = monitor.observe(beat(2, device_id="device-b", boot_id="b1"))
+    assert a_next.kind is DatagramKind.ACCEPTED
+    assert b_next.kind is DatagramKind.ACCEPTED
+    assert monitor.accepted == 6
+    assert monitor.missing == 0
+    assert monitor.restarts == 0
+
+
+# ----------------------------------------------------------------------
 # Staleness and offline detection
 # ----------------------------------------------------------------------
 
@@ -411,3 +560,18 @@ def test_the_reported_lines_name_duplicates_reordering_and_rejection() -> None:
     assert "duplicate" in duplicate
     assert "out-of-order" in out_of_order
     assert "rejected" in rejected
+
+
+def test_the_reported_line_names_a_restart_and_a_superseded_boot() -> None:
+    monitor = StatusMonitor(3000, clock=FakeClock())
+    monitor.observe(beat(1, boot_id="boot-a"))
+
+    restart = format_event("addr", monitor.observe(beat(1, boot_id="boot-b")), monitor)
+    superseded = format_event(
+        "addr", monitor.observe(beat(2, boot_id="boot-a")), monitor
+    )
+
+    assert "boot=boot-b" in restart
+    assert "restarted" in restart
+    assert "earlier boot" in superseded
+    assert "boot=boot-a" in superseded

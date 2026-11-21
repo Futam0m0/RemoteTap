@@ -9,7 +9,10 @@ Each datagram is a single small JSON object, encoded as UTF-8. Unlike the TCP
 channel there is no newline framing and no acknowledgement: UDP gives neither
 delivery, nor ordering, nor uniqueness, so every datagram carries its own
 sequence number and the receiver is responsible for spotting losses, duplicates
-and stale data.
+and stale data. Every datagram also carries a ``boot_id``: the sequence number
+restarts at 1 when the device process restarts, so the boot id lets a receiver
+tell "the device rebooted" apart from "this packet is out of order" (see
+``docs/protocol.md``).
 
 This module is the *only* place that knows the datagram's shape. It has no
 socket code, so it can be tested without any networking at all.
@@ -83,7 +86,16 @@ class StatusDatagram:
 
     Args:
         type: :data:`HEARTBEAT` or :data:`STATUS`.
-        device_id: which device sent this; lets one monitor watch several.
+        device_id: which device sent this; lets one monitor watch several. It is
+            stable across device restarts.
+        boot_id: identifies one *run* of the device service. A fresh, unique id
+            is generated each time the heartbeat service starts, and it stays
+            constant for that run. Because the sequence number resets on a
+            restart, a receiver keys its sequence tracking on
+            ``(device_id, boot_id)`` so a restarted device is recognised as a
+            new instance rather than a flood of out-of-order packets. It is an
+            identity for correlation only: it does **not** authenticate the
+            datagram.
         sequence: 1-based, incremented for every datagram the device *sends*.
             A receiver uses it to spot losses, duplicates and reordering.
         timestamp_ms: the sender's wall-clock time in milliseconds. For display
@@ -97,6 +109,7 @@ class StatusDatagram:
 
     type: str
     device_id: str
+    boot_id: str
     sequence: int
     timestamp_ms: int
     state: str
@@ -110,6 +123,7 @@ class StatusDatagram:
             "v": self.version,
             "type": self.type,
             "device_id": self.device_id,
+            "boot_id": self.boot_id,
             "seq": self.sequence,
             "ts": self.timestamp_ms,
             "status": self.status,
@@ -207,6 +221,7 @@ def parse_datagram(data: bytes) -> StatusDatagram:
     return StatusDatagram(
         type=message_type,
         device_id=_require_text(payload, "device_id"),
+        boot_id=_require_text(payload, "boot_id"),
         sequence=sequence,
         timestamp_ms=_require_int(payload, "ts"),
         state=state,

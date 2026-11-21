@@ -46,19 +46,21 @@ Implemented today:
   fields, wrong sessions, expired leases and oversized lines.
 - **UDP heartbeat / status channel (Phase 3)**: the device emits a small JSON
   datagram (heartbeat or status) every 1000 ms describing whether it is alive and
-  what the actuator is doing. Datagrams carry a version, a device id, an
-  incrementing sequence number and a timestamp, so a receiver can detect lost,
-  duplicate and out-of-order packets and decide when the device has gone stale.
-  The channel is **outbound-only and read-only**: the device never accepts a UDP
-  command, and nothing in a datagram can press, renew, stop or otherwise
-  influence the actuator or the lease.
+  what the actuator is doing. Datagrams carry a version, a device id, a **boot
+  id**, an incrementing sequence number and a timestamp, so a receiver can detect
+  lost, duplicate and out-of-order packets, tell a **device restart** apart from
+  reordering, and decide when the device has gone stale. The channel is
+  **outbound-only and read-only**: the device never accepts a UDP command, and
+  nothing in a datagram can press, renew, stop or otherwise influence the
+  actuator or the lease.
 - **UDP monitoring client** (`python -m remote_tap.monitor`): a console tool that
   receives heartbeats and prints the device's status, sequence number, missing
-  heartbeats, duplicates, out-of-order datagrams and an "offline" notice when
-  beats stop. It is a **development and protocol demonstration tool**, not part
-  of the mobile product, and there is no graphical dashboard.
+  heartbeats, duplicates, out-of-order datagrams, restarts (a new boot id) and an
+  "offline" notice when beats stop. It is a **development and protocol
+  demonstration tool**, not part of the mobile product, and there is no graphical
+  dashboard.
 - **Simulated actuator**, an **interactive command-line client** and the
-  **pytest suite** (176 tests).
+  **pytest suite** (195 tests).
 
 Planned, **not implemented** yet (by design):
 
@@ -226,9 +228,9 @@ example:
 
 ```
 [monitor] listening on 127.0.0.1:8766 (UDP), stale after 3000 ms
-[monitor] seq=1 type=status state=IDLE session_active=no device=remotetap-01 from ('127.0.0.1', 54321)
-[monitor] seq=2 type=heartbeat state=IDLE session_active=no device=remotetap-01 from ('127.0.0.1', 54321)
-[monitor] seq=3 type=status state=PRESSING session_active=yes device=remotetap-01 from ('127.0.0.1', 54321)
+[monitor] seq=1 type=status state=IDLE session_active=no device=remotetap-01 boot=5f3c9a1e from ('127.0.0.1', 54321)
+[monitor] seq=2 type=heartbeat state=IDLE session_active=no device=remotetap-01 boot=5f3c9a1e from ('127.0.0.1', 54321)
+[monitor] seq=3 type=status state=PRESSING session_active=yes device=remotetap-01 boot=5f3c9a1e from ('127.0.0.1', 54321)
 ```
 
 Press the button in Terminal B while watching Terminal C to see `state` move to
@@ -239,9 +241,20 @@ outage once:
 [monitor] device OFFLINE (no status for 3000 ms; last seq=7)
 ```
 
+Start the device service again and the monitor notices the restart by the new
+boot id, resets that device's sequence tracking and ignores any late packet still
+carrying the previous boot id:
+
+```
+[monitor] seq=1 type=status state=IDLE session_active=no device=remotetap-01 boot=8a7b6c5d from ('127.0.0.1', 54999)  !! new boot id: the device restarted, sequence tracking reset
+[monitor] seq=9 from an earlier boot (boot=5f3c9a1e) ignored; superseded by boot '8a7b6c5d...'
+```
+
 Useful flags: `--stale-ms` (offline threshold), `--device-id` (ignore datagrams
 from any other device) and `--verbose`. The monitor cannot command the device:
-it only reads datagrams.
+it only reads datagrams. The boot id identifies a run of the service for
+correlation only — it is not a credential, and UDP datagrams are not
+authenticated (see `docs/protocol.md` section 11).
 
 **4. Tests, from `backend/`:**
 

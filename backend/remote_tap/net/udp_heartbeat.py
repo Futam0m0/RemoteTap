@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from typing import Callable, Optional
 
 from ..actuator.base import ActuatorState
@@ -66,8 +67,12 @@ class HeartbeatService:
         session: the device session, read (never written) for status.
         config: UDP bind/destination addresses, heartbeat interval and stale
             timeout.
-        device_id: identifier put in every datagram.
+        device_id: identifier put in every datagram. Stable across restarts.
         name: label used in log output.
+        boot_id: identity of this run of the service. Generated once here, so it
+            is constant for the life of the service instance and changes when a
+            new instance is created (a process restart). Injectable so tests can
+            pin it; leave it out in normal use.
         clock: monotonic clock, used only to time the sends.
         wall_clock: wall clock, used only for the display-only ``ts`` field.
     """
@@ -79,6 +84,7 @@ class HeartbeatService:
         *,
         device_id: str = DEFAULT_DEVICE_ID,
         name: str = "remotetap",
+        boot_id: Optional[str] = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -86,6 +92,11 @@ class HeartbeatService:
         self._config = config
         self._device_id = device_id
         self._name = name
+        # One fresh id per service instance. The application constructs exactly
+        # one service per process run, so this identifies a "boot": a receiver
+        # can tell a restarted device (new boot id, sequence back to 1) apart
+        # from an out-of-order packet within the same run.
+        self._boot_id = boot_id if boot_id is not None else uuid.uuid4().hex
         self._clock = clock
         self._wall_clock = wall_clock
         self._transport: Optional[asyncio.DatagramTransport] = None
@@ -101,6 +112,15 @@ class HeartbeatService:
     def config(self) -> UdpConfig:
         """The settings this service sends under."""
         return self._config
+
+    @property
+    def boot_id(self) -> str:
+        """Identity of this run of the service, constant for its lifetime.
+
+        Changes only when a new service instance is created, which is how a
+        monitoring client recognises a restarted device.
+        """
+        return self._boot_id
 
     @property
     def is_running(self) -> bool:
@@ -195,6 +215,7 @@ class HeartbeatService:
         return StatusDatagram(
             type=message_type,
             device_id=self._device_id,
+            boot_id=self._boot_id,
             sequence=self._sequence + 1,
             timestamp_ms=int(self._wall_clock() * 1000),
             state=state,
