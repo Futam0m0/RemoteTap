@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>RemoteTap</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="brand">
+        <div class="brand__mark" aria-hidden="true">
+          <span class="brand__dot"></span>
+        </div>
+        <div class="brand__text">
+          <h1>RemoteTap</h1>
+          <p>Remote power-button demonstration</p>
+        </div>
+      </header>
+
+      <section class="status" aria-label="Status">
+        <div class="chip" id="chip-device">
+          <span class="chip__label">Device</span>
+          <span class="chip__value" id="device-value">Connecting</span>
+          <span class="chip__hint" id="device-hint">&mdash;</span>
+        </div>
+        <div class="chip" id="chip-actuator">
+          <span class="chip__label">Actuator</span>
+          <span class="chip__value" id="actuator-value">IDLE</span>
+          <span class="chip__hint" id="actuator-hint">simulated</span>
+        </div>
+        <div class="chip" id="chip-heartbeat">
+          <span class="chip__label">Heartbeat</span>
+          <span class="chip__value" id="heartbeat-value">OFFLINE</span>
+          <span class="chip__hint" id="heartbeat-hint">UDP status</span>
+        </div>
+      </section>
+
+      <section class="control">
+        <button
+          class="power"
+          id="power"
+          type="button"
+          aria-label="Press and hold to hold the power button"
+          aria-pressed="false"
+        >
+          <span class="power__ring" aria-hidden="true"></span>
+          <svg class="power__icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M12 3v9"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+            />
+            <path
+              d="M7.5 6.2a7 7 0 1 0 9 0"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+            />
+          </svg>
+          <span class="power__caption" id="power-caption">Hold to press</span>
+        </button>
+        <p class="control__hint" id="control-hint">
+          Pointer down sends PRESS_START, pointer up sends PRESS_STOP. The device
+          owns the safety lease.
+        </p>
+      </section>
+
+      <section class="details" aria-label="Details">
+        <div class="detail">
+          <span class="detail__label">Last heartbeat</span>
+          <span class="detail__value" id="detail-heartbeat">&mdash;</span>
+        </div>
+        <div class="detail">
+          <span class="detail__label">Sequence</span>
+          <span class="detail__value" id="detail-sequence">&mdash;</span>
+        </div>
+        <div class="detail">
+          <span class="detail__label">Session</span>
+          <span class="detail__value" id="detail-session">&mdash;</span>
+        </div>
+        <div class="detail">
+          <span class="detail__label">Lease</span>
+          <span class="detail__value" id="detail-lease">&mdash;</span>
+        </div>
+      </section>
+
+      <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -59,8 +59,19 @@ Implemented today:
   "offline" notice when beats stop. It is a **development and protocol
   demonstration tool**, not part of the mobile product, and there is no graphical
   dashboard.
+- **Browser demonstration interface (demo only, Phase 3)**: a local, loopback-only
+  web dashboard (`python -m remote_tap.bridge`) with a press-and-hold power
+  button, standing in for the future mobile app so the interaction can be shown
+  and tested in a browser. A browser cannot open raw TCP or UDP sockets, so a
+  small bridge process sits between the page and the device: the page talks to
+  the bridge over **HTTP/WebSocket**, and the bridge talks to the device over
+  the **existing** TCP command protocol and receives the **existing** UDP
+  heartbeats. WebSocket is only the browser-to-bridge transport — it never
+  replaces TCP, and every command still goes through the device's own session
+  manager, lease and watchdog. It is a development demonstration, not part of
+  the mobile product: loopback only, no authentication yet.
 - **Simulated actuator**, an **interactive command-line client** and the
-  **pytest suite** (195 tests).
+  **pytest suite** (226 tests).
 
 Planned, **not implemented** yet (by design):
 
@@ -102,8 +113,10 @@ RemoteTap/
 │   │   ├── net/           # tcp_server.py, udp_heartbeat.py
 │   │   ├── protocol/      # messages.py, validate.py, udp_messages.py
 │   │   ├── safety/        # watchdog.py (lease timer, maximum-duration timer)
+│   │   ├── bridge/        # demo web bridge: device_link.py, press.py, status_hub.py, app.py
+│   │   ├── web/           # demo dashboard assets: index.html, styles.css, app.js
 │   │   └── actuator/      # base.py (interface), simulator.py
-│   └── tests/             # pytest suite (protocol, actuator, session, safety, TCP, UDP)
+│   └── tests/             # pytest suite (protocol, actuator, session, safety, TCP, UDP, bridge)
 └── mobile/                # Expo + React Native + TypeScript app (later phase)
 ```
 
@@ -126,8 +139,9 @@ For later phases:
 
 ## How to run the project
 
-The prototype needs up to three terminals: the device service (TCP commands +
-UDP heartbeats), the command client, and — optionally — the UDP status monitor.
+The prototype needs up to four terminals: the device service (TCP commands +
+UDP heartbeats), the command client, the optional UDP status monitor, and the
+optional browser demo.
 
 > **Run every command from `backend/`, with the virtual environment active.**
 > `remote_tap` is a package inside `backend/`, so `python -m remote_tap...` only
@@ -256,13 +270,46 @@ it only reads datagrams. The boot id identifies a run of the service for
 correlation only — it is not a credential, and UDP datagrams are not
 authenticated (see `docs/protocol.md` section 11).
 
-**4. Tests, from `backend/`:**
+**4. Terminal D (optional) - the browser demo** (cwd `backend/`, venv active):
+
+```bash
+python -m remote_tap.bridge --device-host 127.0.0.1 --device-port 8765
+```
+
+Then open **<http://127.0.0.1:8080>**. The bridge announces itself like this:
+
+```
+12:00:01 INFO    remote_tap.bridge.app: bridge ready: page on http://127.0.0.1:8080, device 127.0.0.1:8765, heartbeats on 127.0.0.1:8766
+```
+
+**Press and hold** the power button on the page: while you hold it, the bridge
+keeps the device's press lease renewed over TCP; when you release — or the
+pointer is cancelled, the window loses focus, or the tab is hidden — it sends
+the stop. The page also shows the device connection, the actuator state
+(`IDLE` / `PRESSING`), the heartbeat status (`ONLINE` / `OFFLINE`), the last
+heartbeat and the sequence number.
+
+The browser talks to the bridge over **HTTP and WebSocket**; it never opens a
+TCP or UDP socket itself, and it is never trusted with the lease. The device's
+own lease timeout, disconnect release and maximum press duration are unchanged
+and still in force, so a closed page, a killed bridge or a stalled browser
+cannot leave the button held down.
+
+Because the bridge listens for heartbeats on the same port as the monitor, run
+**either** Terminal C **or** Terminal D, not both. Pass `--no-udp` to run the
+bridge without the status channel (commands are unaffected), or move the ports
+with `--udp-port` / `--web-port`. Useful flags: `--web-host` (default
+`127.0.0.1`; do not expose the demo beyond this machine — there is no
+authentication), `--stale-ms` (should match the device's), `--device-id` and
+`--verbose`.
+
+**5. Tests, from `backend/`:**
 
 ```bash
 pytest -q
 ```
 
-**5. Mobile app (later phase), from `mobile/`:**
+**6. Mobile app (later phase), from `mobile/`:**
 
 ```bash
 npm install
@@ -291,15 +338,19 @@ connection that started a press may renew or stop it), the **lease timeout**
 (1000 ms without a valid renewal → release), the **maximum press duration**
 (3000 ms hard ceiling that no client message can extend), the **watchdog**
 enforcing both, and the **read-only UDP status channel** (heartbeats with
-sequence numbers and staleness detection). Authentication is not implemented,
-and the UDP datagrams are neither authenticated nor secure.
+sequence numbers and staleness detection). The browser demo does not change any
+of this: it is an ordinary TCP client of the device (through the local bridge),
+so it inherits the same release-on-disconnect, ownership and lease rules.
+Authentication is not implemented, and the UDP datagrams are neither
+authenticated nor secure.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — components, layering,
   networking topology, the TCP/UDP split and why UDP cannot touch the actuator,
   the safety model, non-goals, open questions. Each layer and safety invariant is
-  marked implemented or planned.
+  marked implemented or planned. Section 4.3 explains the local demo bridge and
+  why it adds no new safety mechanism.
 - [docs/protocol.md](docs/protocol.md) — the wire protocol. Sections 3–10
   document the TCP command channel (`PRESS_START` / `PRESS_RENEW` /
   `PRESS_STOP` / `ACK` / `ERROR`, JSON Lines framing, command and session ids,

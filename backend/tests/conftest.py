@@ -187,3 +187,25 @@ async def udp_recorder() -> AsyncIterator[UdpRecorder]:
         yield protocol
     finally:
         transport.close()
+
+
+@pytest.fixture
+def wait_until() -> Callable[..., Awaitable[bool]]:
+    """Poll a predicate until it holds, instead of sleeping a fixed amount.
+
+    Keeps tests that depend on a background task (a lease renewal, a heartbeat
+    arriving, a connection closing) quick and free of arbitrary delays.
+    """
+
+    async def _wait_until(
+        predicate: Callable[[], bool], timeout: float = 2.0, interval: float = 0.005
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(interval)
+        return predicate()
+
+    return _wait_until

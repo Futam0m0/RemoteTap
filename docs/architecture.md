@@ -15,6 +15,12 @@
 >   per-run **boot id**, duplicate and reordering handling, restart detection,
 >   and staleness detection in the monitoring client. It cannot influence the
 >   actuator, the lease or the watchdog.
+> * **Implemented (browser demo)**: a local, loopback-only **web bridge**
+>   (`remote_tap.bridge`) that serves a dashboard over HTTP, streams state over
+>   WebSocket, translates the page's press events into the *existing* TCP command
+>   protocol and forwards the *existing* UDP status. It is a client of the
+>   device, adds no new safety mechanism, and exists only to demonstrate the
+>   interaction until the Expo app replaces it (section 4.3).
 > * **Planned (authentication)**: the handshake and shared-secret auth —
 >   **not implemented**. Neither channel is authenticated today.
 > * **Future (hardware)**: Raspberry Pi GPIO / servo integration — **not
@@ -85,6 +91,10 @@ Key properties:
 - The **UDP status channel is outbound-only** from the device. The device sends
   heartbeats from an ephemeral source port to a configured destination; it binds
   no listening UDP port and accepts no UDP input.
+- The **browser demo is a client, not a layer**: a local bridge is an ordinary
+  TCP client of the device (plus a UDP status listener) that re-exposes the
+  interaction to a page. It cannot bypass the session manager, and it owns no
+  safety behaviour of its own. Section 4.3 covers it.
 
 > The status monitor in the diagram is a **development and protocol
 > demonstration tool**, not part of the mobile product. No graphical monitoring
@@ -259,6 +269,73 @@ actuator, the lease or the watchdog, because the UDP path has no route into the
 session (section 4.1). Authenticating datagrams is deferred to the
 authentication phase.
 
+### 4.3 The local demo bridge (a stand-in for the mobile app)
+
+The Expo app does not exist yet, so `remote_tap.bridge` is a small,
+**loopback-only** process that lets a browser demonstrate the press-and-hold
+interaction. It exists for one reason: a web page cannot open a raw TCP or UDP
+socket, so something has to sit between the browser and the device and speak the
+device's protocols on the page's behalf.
+
+```
+  Browser (page)            Bridge (this machine)                Device service
+  ┌───────────────┐  HTTP   ┌────────────────────┐   TCP (existing)  ┌───────────────┐
+  │  dashboard    │◄────────│ FastAPI + uvicorn  │──────────────────►│ TCP command   │
+  │  press/hold   │  WS     │  • DeviceLink      │  PRESS_START/…    │ server        │
+  │  status chips │◄───────►│  • PressController  │                  │ session +     │
+  └───────────────┘         │  • StatusHub        │◄─── UDP (existing)│ lease/watchdog│
+                            └────────────────────┘   heartbeat/status └───────────────┘
+```
+
+**It is a client of the device, in exactly the sense any other client is:**
+
+- `bridge/device_link.py` opens **one** TCP connection and speaks the existing
+  command protocol on it (`PRESS_START` / `PRESS_RENEW` / `PRESS_STOP`, `ACK` /
+  `ERROR`). Because it is a single ordinary connection, it inherits the device's
+  ownership model unchanged — it cannot bypass the session manager, and a
+  browser request can only ever do what the protocol itself allows.
+- `bridge/press.py` owns at most one press and, while it is held, renews the
+  lease over that same TCP connection on a timer. The interval is taken from the
+  `renew_interval_ms` the device advertises in its `ACK`, and every renewal is a
+  **new** command, because a repeated `command_id` is treated as a retry and
+  would not extend the lease. A repeated pointer-down from the page that started
+  the press is reported as the press already in progress rather than restarted
+  (restarting would reset the device's maximum-duration timer); a second page
+  that presses while another holds the button is refused before any command
+  reaches the device.
+- `bridge/status_hub.py` is the **only** UDP listener on the heartbeat port and
+  reuses the shipped `StatusMonitor` to interpret datagrams. It does not open a
+  second receiver competing with `remote_tap.monitor`: the two are alternatives,
+  not companions, on the same port.
+- `bridge/app.py` serves the page and its assets, streams state snapshots over
+  one WebSocket, and applies the page's requests through the press controller.
+
+**WebSocket does not replace TCP.** It is only the browser-to-bridge transport,
+because that is all a page has. The command path from the bridge to the device
+is the original newline-delimited JSON over TCP, unchanged, and the status path
+is the original heartbeat datagram, unchanged. No protocol was rewritten to
+accommodate the browser, and no browser request reaches the device without going
+through the device's own validation, ownership check and lease.
+
+**What it deliberately does not do.** It does not reimplement the session
+manager, the lease, the watchdog or the actuator; it adds no safety rule of its
+own; it does not expose the service publicly (the page binds loopback by
+default); and it does not enforce the lease or the maximum press duration. The
+page's own release handling is a convenience layered on top of the device's
+rules, never the mechanism that protects the actuator.
+
+**Safety on disconnect**, using only device behaviour that already existed:
+
+| What goes away | What releases the actuator |
+| --- | --- |
+| The page (tab closed, socket dropped) | The bridge sees the WebSocket close and sends `PRESS_STOP` for the press that connection owned. If that cannot be sent, the next row covers it. |
+| The bridge process, or its TCP connection | The device runs its own `release_if_client` for that connection, and the lease stops being renewed. |
+| The page stalls but stays connected | Nothing new is required: the bridge renews only while it holds a press, so the device's lease timeout still ends it. |
+| The bridge stalls but its socket stays open | The device's **lease timeout** fires within 1000 ms, and the **maximum press duration** (3000 ms) still caps the hold. |
+
+So the page holds no safety-critical role: it cannot extend a press past the
+lease, and it cannot keep a press alive after it has gone.
+
 ## 5. Safety model
 
 The device is authoritative. The invariants below describe the target behaviour;
@@ -397,6 +474,16 @@ backend/
     actuator/
       base.py        # implemented: Actuator interface
       simulator.py   # implemented: SimulatedActuator
+    bridge/          # implemented: local demo bridge (browser interface, section 4.3)
+      device_link.py   # implemented: one TCP connection speaking the command protocol
+      press.py         # implemented: the single press + its lease renewals
+      status_hub.py    # implemented: sole UDP listener; reuses monitor.StatusMonitor
+      app.py           # implemented: FastAPI app (HTTP + WebSocket), state fan-out
+      __main__.py      # implemented: `python -m remote_tap.bridge` entry point
+    web/             # implemented: demo dashboard assets (no build step, no bundler)
+      index.html       # implemented: dashboard markup
+      styles.css       # implemented: dark-first responsive theme
+      app.js           # implemented: WebSocket client + pointer-event hold
   tests/
     test_protocol.py       # implemented
     test_actuator.py       # implemented
@@ -405,6 +492,10 @@ backend/
     test_safety.py         # implemented (lease expiry, maximum duration, watchdog)
     test_udp_protocol.py   # implemented (datagram codec + monitor logic, no sockets)
     test_udp_heartbeat.py  # implemented (real UDP socket, isolation from TCP)
+    test_bridge_link.py    # implemented (bridge TCP link vs. the real command server)
+    test_bridge_press.py   # implemented (press, renewals, ownership, device limits)
+    test_bridge_status.py  # implemented (UDP forwarding, offline, port exclusivity)
+    test_bridge_app.py     # implemented (real uvicorn HTTP + WebSocket, end to end)
 
 mobile/                  # PLANNED (later phase) - does not exist yet
   src/
@@ -421,13 +512,18 @@ mobile/                  # PLANNED (later phase) - does not exist yet
 - No OTA updates, no Docker, no CI beyond running `pytest` locally.
 - No multi-PC, multi-user, or scheduled-press features.
 - **No graphical monitoring dashboard, in the app or elsewhere.** The UDP
-  monitor is a console tool for developing and demonstrating the protocol.
+  monitor is a console tool for developing and demonstrating the protocol. The
+  browser demo (section 4.3) is a temporary stand-in for the mobile app's hold
+  button — a demonstration of the interaction, not a product dashboard — and is
+  replaced by the Expo app.
+- **No new safety mechanism in the demo.** The bridge reuses the existing lease,
+  disconnect release and watchdog; it does not add or replace any of them.
 - No authentication, and no Tailscale automation: both are a later phase.
 
 ## 9. Testing strategy
 
-Implemented tests (195, all passing) cover Phase 1, the Phase 2 lease and the
-Phase 3 UDP status channel:
+Implemented tests (226, all passing) cover Phase 1, the Phase 2 lease, the
+Phase 3 UDP status channel and the browser demo bridge:
 
 - **Protocol** (`tests/test_protocol.py`): encode/decode round-trips, malformed
   frames, unknown types, missing/empty fields, non-object payloads, size limits,
@@ -486,6 +582,46 @@ Phase 3 UDP status channel:
   the life of one service instance, a second instance generates a different one,
   and a real stop/start pair of services is recognised by the monitor as a single
   restart with no out-of-order or superseded events.
+- **Bridge: TCP link** (`tests/test_bridge_link.py`): the bridge's link against a
+  real command server — a `PRESS_START` `ACK` carrying the lease policy, sending
+  before connecting raising, a disconnect noticed *promptly* (the `on_lost`
+  callback fires) rather than only on the next send, closing a link releasing a
+  press it owns, a second connection being refused (`INVALID_SESSION`) while the
+  first still holds the session, and a bad session renewal being rejected.
+- **Bridge: press controller** (`tests/test_bridge_press.py`): press and release
+  through the controller; the bridge **renewing the lease while the button is
+  held** (the press outlives several lease timeouts); the device's maximum
+  duration ending the press on its own and the reason being recorded; a second
+  browser being refused (`NOT_OWNER`); `release_if_owner` acting only for the
+  true owner; a repeated `press_start` **not** restarting the press (the session
+  id is unchanged — a stale or duplicated request cannot reset the device's
+  timer); stopping while idle being a no-op; a press with no link reporting an
+  error; and a lost link clearing the bridge's press.
+- **Bridge: UDP status** (`tests/test_bridge_status.py`): a heartbeat forwarded to
+  the page and firing the update callback; a malformed datagram counted as
+  `rejected` and leaving no status; another device's datagrams ignored when a
+  device id is expected; a new boot id recognised as a restart (its sequence `1`
+  accepted, not out of order); the device going offline after silence; and a
+  **second listener being unable to bind the same port**, which is what proves
+  the bridge is the sole UDP receiver rather than a competitor.
+- **Bridge: end to end** (`tests/test_bridge_app.py`): the real FastAPI app under
+  a real uvicorn server, driven over real HTTP and a real WebSocket against the
+  real device TCP server — the dashboard and its assets served; `/api/state`
+  reporting a live link and an idle actuator; a new WebSocket greeted with state;
+  press and release driving the device session; **closing the page releasing the
+  press**, so the actuator is never left held; an unknown action and a non-JSON
+  message refused as notices without killing the connection; a second page unable
+  to stop another page's press; a UDP heartbeat reaching the page with its
+  sequence number; `BridgeRuntime` shutdown releasing the press; and a bridge
+  pointed at a dead port still serving the page and reporting the device as
+  disconnected.
+
+The bridge tests drive the same HTTP/WebSocket interface the page uses; the
+page's own JavaScript is not executed by the suite. Pointer-cancellation,
+lost-capture and visibility handling live in `web/app.js` and are exercised
+manually in a browser; what the tests pin down is the equivalent backend
+guarantee — that a browser going away releases the press — plus the message the
+page sends for every release path.
 
 Timing tests use short, injected `PressLimits` / `UdpConfig` and an injectable
 monotonic clock rather than real sleeps, so the whole suite runs in a few
